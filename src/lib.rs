@@ -13,10 +13,12 @@
 //! ```
 
 pub mod deskew;
+pub mod deskew_gpu;
 pub mod dma;
 pub mod h264;
 pub mod jpeg;
 pub mod jpegd;
+pub mod opencl;
 pub mod platform;
 pub mod rc;
 pub mod service;

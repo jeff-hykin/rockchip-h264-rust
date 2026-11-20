@@ -1,10 +1,14 @@
 //! Deskewing (undistorting) a decoded frame before it is encoded: a remap table built once per input size from the
 //! camera's intrinsics, then a table lookup per output sample (bilinear or nearest) with no per-frame allocation.
 //!
-//! The camera models are OpenCV's: `plumb_bob` (k1, k2, p1, p2, k3, as `cv::initUndistortRectifyMap`) and
-//! `equidistant` (k1..k4, the Kannala-Brandt fisheye of `cv::fisheye`). The output camera matrix follows
-//! `cv::fisheye::estimateNewCameraMatrixForUndistortRectify`: `balance` 0 keeps only pixels the camera saw (zoomed
-//! in), 1 keeps the whole field of view, scaled to the output size.
+//! The lens models are the ones CameraInfo names, with OpenCV's math: `plumb_bob` (k1, k2, p1, p2, k3) and
+//! `rational_polynomial` (k1, k2, p1, p2, k3, k4, k5, k6) as `cv::initUndistortRectifyMap`, and `equidistant` (k1..k4,
+//! the Kannala-Brandt fisheye of `cv::fisheye`; also accepted as `fisheye` / `kannala_brandt`).
+//!
+//! The output is a pinhole image (straight lines stay straight), or for wide lenses a cylindrical or equirectangular
+//! one (vertical lines stay straight; the whole field of view fits without the black wedges a pinhole needs). Its
+//! scale follows `cv::fisheye::estimateNewCameraMatrixForUndistortRectify`, generalized to the output projection:
+//! `balance` 0 keeps only what every edge of the frame saw, 1 the whole field of view, scaled to the output size.
 
 use anyhow::{bail, ensure, Result};
 
@@ -14,8 +18,30 @@ use crate::jpeg::Sampling;
 pub enum Model {
     /// k1, k2, p1, p2, k3 (missing terms are zero)
     PlumbBob,
+    /// k1, k2, p1, p2, k3, k4, k5, k6: radial (1 + k1r² + k2r⁴ + k3r⁶) / (1 + k4r² + k5r⁴ + k6r⁶)
+    RationalPolynomial,
     /// k1, k2, k3, k4: θd = θ(1 + k1θ² + k2θ⁴ + k3θ⁶ + k4θ⁸)
     Equidistant,
+}
+
+impl Model {
+    /// How many coefficients the model takes (CameraInfo's D length).
+    pub fn coefficient_count(self) -> usize {
+        match self {
+            Self::PlumbBob => 5,
+            Self::RationalPolynomial => 8,
+            Self::Equidistant => 4,
+        }
+    }
+
+    /// The name CameraInfo uses.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::PlumbBob => "plumb_bob",
+            Self::RationalPolynomial => "rational_polynomial",
+            Self::Equidistant => "equidistant",
+        }
+    }
 }
 
 impl std::str::FromStr for Model {
@@ -24,8 +50,11 @@ impl std::str::FromStr for Model {
     fn from_str(s: &str) -> Result<Self> {
         match s {
             "plumb_bob" => Ok(Self::PlumbBob),
-            "equidistant" | "fisheye" => Ok(Self::Equidistant),
-            other => bail!("unknown distortion model {other:?} (plumb_bob or equidistant)"),
+            "rational_polynomial" => Ok(Self::RationalPolynomial),
+            "equidistant" | "fisheye" | "kannala_brandt" => Ok(Self::Equidistant),
+            other => bail!(
+                "unknown distortion model {other:?} (plumb_bob, rational_polynomial, or equidistant / fisheye / kannala_brandt)"
+            ),
         }
     }
 }
@@ -48,6 +77,61 @@ impl std::str::FromStr for Interpolation {
     }
 }
 
+/// How the deskewed image maps view directions to pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Projection {
+    /// x = X/Z, y = Y/Z: straight lines stay straight; cannot hold 180 degrees
+    Pinhole,
+    /// x = azimuth, y = Y / horizontal distance: vertical lines stay straight, any horizontal field of view
+    Cylindrical,
+    /// x = azimuth, y = elevation: angles map linearly to pixels
+    Equirectangular,
+}
+
+impl Projection {
+    /// The name CameraInfo's `distortion_model` carries for an output in this projection.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Pinhole => "pinhole",
+            Self::Cylindrical => "cylindrical",
+            Self::Equirectangular => "equirectangular",
+        }
+    }
+
+    /// A view direction -> this projection's normalized image plane.
+    fn to_plane(self, [x, y, z]: [f64; 3]) -> (f64, f64) {
+        match self {
+            Self::Pinhole => (x / z, y / z),
+            Self::Cylindrical => (x.atan2(z), y / x.hypot(z)),
+            Self::Equirectangular => (x.atan2(z), y.atan2(x.hypot(z))),
+        }
+    }
+
+    /// This projection's normalized image plane -> a view direction.
+    fn from_plane(self, a: f64, b: f64) -> [f64; 3] {
+        match self {
+            Self::Pinhole => [a, b, 1.0],
+            Self::Cylindrical => [a.sin(), b, a.cos()],
+            Self::Equirectangular => [a.sin() * b.cos(), b.sin(), a.cos() * b.cos()],
+        }
+    }
+}
+
+impl std::str::FromStr for Projection {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "pinhole" => Ok(Self::Pinhole),
+            "cylindrical" => Ok(Self::Cylindrical),
+            "equirectangular" => Ok(Self::Equirectangular),
+            other => {
+                bail!("unknown projection {other:?} (pinhole, cylindrical or equirectangular)")
+            }
+        }
+    }
+}
+
 /// A camera's intrinsics at one image size.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Intrinsics {
@@ -62,6 +146,30 @@ pub struct Intrinsics {
 }
 
 impl Intrinsics {
+    /// Refuses coefficients the model doesn't take, and a camera that can't be right.
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.fx > 0.0 && self.fy > 0.0,
+            "focal lengths must be positive"
+        );
+        ensure!(
+            self.width > 0 && self.height > 0,
+            "the calibrated size must be positive"
+        );
+        let n = self.model.coefficient_count();
+        ensure!(
+            self.coefficients.len() <= n,
+            "{} takes at most {n} distortion coefficients, got {}",
+            self.model.name(),
+            self.coefficients.len()
+        );
+        ensure!(
+            self.coefficients.iter().all(|c| c.is_finite()),
+            "distortion coefficients must be finite"
+        );
+        Ok(())
+    }
+
     /// The same camera at another image size (the focal lengths and center scale with it).
     pub fn scaled_to(&self, width: u32, height: u32) -> Self {
         let (sx, sy) = (
@@ -83,81 +191,119 @@ impl Intrinsics {
         self.coefficients.get(i).copied().unwrap_or(0.0)
     }
 
-    /// Normalized undistorted (x, y) -> normalized distorted (x, y).
-    fn distort(&self, x: f64, y: f64) -> (f64, f64) {
-        match self.model {
-            Model::PlumbBob => {
-                let (k1, k2, p1, p2, k3) = (self.k(0), self.k(1), self.k(2), self.k(3), self.k(4));
-                let r2 = x * x + y * y;
-                let radial = 1.0 + r2 * (k1 + r2 * (k2 + r2 * k3));
-                (
-                    x * radial + 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x),
-                    y * radial + p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y,
-                )
-            }
-            Model::Equidistant => {
-                let r = (x * x + y * y).sqrt();
-                if r < 1e-12 {
-                    return (x, y);
-                }
-                let theta = r.atan();
-                let t2 = theta * theta;
-                let theta_d = theta
-                    * (1.0
-                        + t2 * (self.k(0) + t2 * (self.k(1) + t2 * (self.k(2) + t2 * self.k(3)))));
-                let scale = theta_d / r;
-                (x * scale, y * scale)
-            }
-        }
+    /// (k1, k2, p1, p2, k3, k4, k5, k6) of the plumb_bob / rational_polynomial models.
+    fn brown(&self) -> [f64; 8] {
+        std::array::from_fn(|i| self.k(i))
     }
 
-    /// Normalized distorted (x, y) -> normalized undistorted (x, y), solved iteratively as OpenCV does.
-    fn undistort(&self, xd: f64, yd: f64) -> (f64, f64) {
-        match self.model {
-            Model::PlumbBob => {
-                let (mut x, mut y) = (xd, yd);
-                for _ in 0..20 {
-                    let (dx, dy) = self.distort(x, y);
-                    x += xd - dx;
-                    y += yd - dy;
+    /// Radial factor and tangential offset of the Brown-Conrady models at normalized (x, y).
+    fn brown_terms(&self, x: f64, y: f64) -> (f64, f64, f64) {
+        let [k1, k2, p1, p2, k3, k4, k5, k6] = self.brown();
+        let r2 = x * x + y * y;
+        let radial =
+            (1.0 + r2 * (k1 + r2 * (k2 + r2 * k3))) / (1.0 + r2 * (k4 + r2 * (k5 + r2 * k6)));
+        let dx = 2.0 * p1 * x * y + p2 * (r2 + 2.0 * x * x);
+        let dy = p1 * (r2 + 2.0 * y * y) + 2.0 * p2 * x * y;
+        (radial, dx, dy)
+    }
+
+    fn theta_d(&self, theta: f64) -> f64 {
+        let t2 = theta * theta;
+        theta * (1.0 + t2 * (self.k(0) + t2 * (self.k(1) + t2 * (self.k(2) + t2 * self.k(3)))))
+    }
+
+    /// A view direction (camera frame, +z forward) -> the pixel the lens images it at, if it does.
+    fn project(&self, [x, y, z]: [f64; 3]) -> Option<(f64, f64)> {
+        let (xd, yd) = match self.model {
+            Model::PlumbBob | Model::RationalPolynomial => {
+                if z <= 1e-9 {
+                    return None;
                 }
-                (x, y)
+                let (x, y) = (x / z, y / z);
+                let (radial, dx, dy) = self.brown_terms(x, y);
+                (x * radial + dx, y * radial + dy)
             }
             Model::Equidistant => {
-                let theta_d = (xd * xd + yd * yd).sqrt();
+                let r = x.hypot(y);
+                if r < 1e-12 {
+                    if z <= 0.0 {
+                        return None;
+                    }
+                    (0.0, 0.0)
+                } else {
+                    let scale = self.theta_d(r.atan2(z)) / r;
+                    (x * scale, y * scale)
+                }
+            }
+        };
+        Some((self.fx * xd + self.cx, self.fy * yd + self.cy))
+    }
+
+    /// A pixel -> the view direction it saw, inverting the lens iteratively as OpenCV does.
+    fn unproject(&self, u: f64, v: f64) -> [f64; 3] {
+        let (xd, yd) = ((u - self.cx) / self.fx, (v - self.cy) / self.fy);
+        match self.model {
+            Model::PlumbBob | Model::RationalPolynomial => {
+                // Newton on the 2D distortion (a numeric Jacobian): converges where OpenCV's fixed-point loop stalls
+                let distort = |x: f64, y: f64| {
+                    let (radial, dx, dy) = self.brown_terms(x, y);
+                    (x * radial + dx, y * radial + dy)
+                };
+                let (mut x, mut y) = (xd, yd);
+                for _ in 0..30 {
+                    let (fx, fy) = distort(x, y);
+                    let (ex, ey) = (fx - xd, fy - yd);
+                    if ex.abs() < 1e-14 && ey.abs() < 1e-14 {
+                        break;
+                    }
+                    let h = 1e-7;
+                    let (ax, ay) = distort(x + h, y);
+                    let (bx, by) = distort(x, y + h);
+                    let (j11, j21, j12, j22) =
+                        ((ax - fx) / h, (ay - fy) / h, (bx - fx) / h, (by - fy) / h);
+                    let det = j11 * j22 - j12 * j21;
+                    if det.abs() < 1e-12 {
+                        break;
+                    }
+                    x -= (j22 * ex - j12 * ey) / det;
+                    y -= (-j21 * ex + j11 * ey) / det;
+                }
+                [x, y, 1.0]
+            }
+            Model::Equidistant => {
+                let theta_d = xd.hypot(yd);
                 if theta_d < 1e-12 {
-                    return (xd, yd);
+                    return [0.0, 0.0, 1.0];
                 }
                 let mut theta = theta_d;
                 for _ in 0..20 {
                     let t2 = theta * theta;
                     let (k1, k2, k3, k4) = (self.k(0), self.k(1), self.k(2), self.k(3));
-                    let f = theta * (1.0 + t2 * (k1 + t2 * (k2 + t2 * (k3 + t2 * k4)))) - theta_d;
                     let df =
                         1.0 + t2 * (3.0 * k1 + t2 * (5.0 * k2 + t2 * (7.0 * k3 + t2 * 9.0 * k4)));
-                    theta -= f / df;
+                    theta -= (self.theta_d(theta) - theta_d) / df;
                 }
-                // past 90 degrees there is no pinhole point; keep the ray at the edge of the plane
-                let theta = theta.clamp(0.0, std::f64::consts::FRAC_PI_2 - 1e-6);
-                let scale = theta.tan() / theta_d;
-                (xd * scale, yd * scale)
+                let s = theta.sin() / theta_d;
+                [xd * s, yd * s, theta.cos()]
             }
         }
     }
 }
 
-/// What to produce: the output size (the input's when `None`), how much of the field of view to keep, and how
-/// samples are interpolated.
+/// What to produce: the output projection and size (the input's when `None`), how much of the field of view to
+/// keep, and how samples are interpolated.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Options {
+    pub projection: Projection,
     pub output_size: Option<(u32, u32)>,
     pub balance: f64,
     pub interpolation: Interpolation,
 }
 
-/// A pinhole camera matrix (no distortion) for the deskewed frames.
+/// The deskewed frames' camera: no lens distortion, `projection` with these scales and center.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Pinhole {
+pub struct Output {
+    pub projection: Projection,
     pub width: u32,
     pub height: u32,
     pub fx: f64,
@@ -166,26 +312,37 @@ pub struct Pinhole {
     pub cy: f64,
 }
 
-/// `cv::fisheye::estimateNewCameraMatrixForUndistortRectify` (fov_scale 1, R identity), for either model.
-pub fn new_camera(camera: &Intrinsics, options: &Options) -> Pinhole {
+/// `cv::fisheye::estimateNewCameraMatrixForUndistortRectify` (fov_scale 1, R identity), for any lens model and output
+/// projection: the four edge midpoints' view directions, on the output's plane, set the scale and center.
+pub fn new_camera(camera: &Intrinsics, options: &Options) -> Output {
     let (w, h) = (camera.width as f64, camera.height as f64);
     let balance = options.balance.clamp(0.0, 1.0);
     let edges = [(w * 0.5, 0.0), (w, h * 0.5), (w * 0.5, h), (0.0, h * 0.5)];
     let points: Vec<(f64, f64)> = edges
         .iter()
-        .map(|&(u, v)| camera.undistort((u - camera.cx) / camera.fx, (v - camera.cy) / camera.fy))
+        .map(|&(u, v)| {
+            let mut ray = camera.unproject(u, v);
+            if options.projection == Projection::Pinhole {
+                // past 90 degrees there is no pinhole point; keep the ray just inside the plane (as OpenCV does)
+                let side = ray[0].hypot(ray[1]);
+                let min_z = side * (1e-6f64).tan();
+                ray[2] = ray[2].max(min_z);
+            }
+            options.projection.to_plane(ray)
+        })
         .collect();
     let aspect = camera.fx / camera.fy;
     let cn = (
         points.iter().map(|p| p.0).sum::<f64>() / 4.0,
         aspect * points.iter().map(|p| p.1).sum::<f64>() / 4.0,
     );
-    let xs = points.iter().map(|p| p.0);
-    let ys: Vec<f64> = points.iter().map(|p| p.1 * aspect).collect();
-    let (minx, maxx) = xs.fold((f64::MAX, f64::MIN), |(a, b), x| (a.min(x), b.max(x)));
-    let (miny, maxy) = ys
+    let (minx, maxx) = points
         .iter()
-        .fold((f64::MAX, f64::MIN), |(a, b), &y| (a.min(y), b.max(y)));
+        .fold((f64::MAX, f64::MIN), |(a, b), p| (a.min(p.0), b.max(p.0)));
+    let (miny, maxy) = points
+        .iter()
+        .map(|p| p.1 * aspect)
+        .fold((f64::MAX, f64::MIN), |(a, b), y| (a.min(y), b.max(y)));
     let fs = [
         w * 0.5 / (cn.0 - minx),
         w * 0.5 / (maxx - cn.0),
@@ -195,21 +352,18 @@ pub fn new_camera(camera: &Intrinsics, options: &Options) -> Pinhole {
     let fmin = fs.iter().copied().fold(f64::MAX, f64::min);
     let fmax = fs.iter().copied().fold(f64::MIN, f64::max);
     let f = balance * fmin + (1.0 - balance) * fmax;
-    let (mut fx, mut fy) = (f, f / aspect);
-    let (mut cx, mut cy) = (-cn.0 * f + w * 0.5, (-cn.1 * f + h * aspect * 0.5) / aspect);
+    let (fx, fy) = (f, f / aspect);
+    let (cx, cy) = (-cn.0 * f + w * 0.5, (-cn.1 * f + h * aspect * 0.5) / aspect);
     let (ow, oh) = options.output_size.unwrap_or((camera.width, camera.height));
     let (sx, sy) = (ow as f64 / w, oh as f64 / h);
-    fx *= sx;
-    cx *= sx;
-    fy *= sy;
-    cy *= sy;
-    Pinhole {
+    Output {
+        projection: options.projection,
         width: ow,
         height: oh,
-        fx,
-        fy,
-        cx,
-        cy,
+        fx: fx * sx,
+        fy: fy * sy,
+        cx: cx * sx,
+        cy: cy * sy,
     }
 }
 
@@ -262,7 +416,9 @@ pub struct Deskew {
     options: Options,
     /// (input width, height, sampling) the tables are for
     built_for: Option<(u32, u32, Sampling)>,
-    output: Option<Pinhole>,
+    /// a process-unique id of the current tables, so a copy of them elsewhere (the GPU's) knows when it is stale
+    generation: u64,
+    output: Option<Output>,
     luma: Option<PlaneMap>,
     chroma: Option<PlaneMap>,
 }
@@ -275,7 +431,7 @@ pub fn layout(width: u32, height: u32) -> (usize, usize) {
     )
 }
 
-fn chroma_rows(rows: usize, sampling: Sampling) -> usize {
+pub(crate) fn chroma_rows(rows: usize, sampling: Sampling) -> usize {
     match sampling {
         Sampling::Yuv420 => rows / 2,
         Sampling::Yuv422 => rows,
@@ -285,10 +441,7 @@ fn chroma_rows(rows: usize, sampling: Sampling) -> usize {
 impl Deskew {
     /// `camera` may be given at any size: it is scaled to each input's size.
     pub fn new(camera: Intrinsics, options: Options) -> Result<Self> {
-        ensure!(
-            camera.fx > 0.0 && camera.fy > 0.0,
-            "focal lengths must be positive"
-        );
+        camera.validate()?;
         ensure!(
             (0.0..=1.0).contains(&options.balance),
             "balance must be within 0..=1"
@@ -303,6 +456,7 @@ impl Deskew {
             camera,
             options,
             built_for: None,
+            generation: 0,
             output: None,
             luma: None,
             chroma: None,
@@ -310,8 +464,25 @@ impl Deskew {
     }
 
     /// The pinhole camera of the deskewed frames for this input size (what their CameraInfo should say).
-    pub fn output_camera(&self, width: u32, height: u32) -> Pinhole {
+    pub fn output_camera(&self, width: u32, height: u32) -> Output {
         new_camera(&self.camera.scaled_to(width, height), &self.options)
+    }
+
+    /// The input the tables are built for.
+    pub fn built_for(&self) -> Option<(u32, u32, Sampling)> {
+        self.built_for
+    }
+
+    /// The (luma, chroma) tap tables, once built (for the GPU path).
+    pub(crate) fn tables(&self) -> Option<(&[u32], &[u32])> {
+        Some((
+            self.luma.as_ref()?.taps.as_slice(),
+            self.chroma.as_ref()?.taps.as_slice(),
+        ))
+    }
+
+    pub(crate) fn bilinear(&self) -> bool {
+        self.options.interpolation == Interpolation::Bilinear
     }
 
     /// The output size for an input of this size.
@@ -341,7 +512,7 @@ impl Deskew {
             1,
             (width as f64, height as f64),
             bilinear,
-            |u, v| source_position(&camera, &out, u, v),
+            |u, v| source_position(&camera, &out, u, v).unwrap_or((f64::NAN, f64::NAN)),
         ));
         // chroma: one sample per 2 (and for 4:2:0, 2x2) luma samples, sited at their center
         let (sub_x, sub_y) = match sampling {
@@ -361,12 +532,19 @@ impl Deskew {
             bilinear,
             |u, v| {
                 let (lu, lv) = ((u + 0.5) * sub_x - 0.5, (v + 0.5) * sub_y - 0.5);
-                let (x, y) = source_position(&camera, &out, lu, lv);
+                let (x, y) = source_position(&camera, &out, lu, lv).unwrap_or((f64::NAN, f64::NAN));
                 ((x + 0.5) / sub_x - 0.5, (y + 0.5) / sub_y - 0.5)
             },
         ));
         self.output = Some(out);
         self.built_for = Some((width, height, sampling));
+        static GENERATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        self.generation = GENERATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Changes with every table build (0: none yet).
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Remaps `src` into `dst` (built for `src`'s size with [`Deskew::prepare`]; both 8-bit semi-planar).
@@ -402,11 +580,13 @@ impl Deskew {
     }
 }
 
-/// Output pixel (u, v) of the deskewed frame -> position in the input frame, both in pixels.
-fn source_position(camera: &Intrinsics, out: &Pinhole, u: f64, v: f64) -> (f64, f64) {
-    let (x, y) = ((u - out.cx) / out.fx, (v - out.cy) / out.fy);
-    let (xd, yd) = camera.distort(x, y);
-    (camera.fx * xd + camera.cx, camera.fy * yd + camera.cy)
+/// Output pixel (u, v) of the deskewed frame -> position in the input frame, both in pixels (`None`: a direction the
+/// lens doesn't see).
+fn source_position(camera: &Intrinsics, out: &Output, u: f64, v: f64) -> Option<(f64, f64)> {
+    let ray = out
+        .projection
+        .from_plane((u - out.cx) / out.fx, (v - out.cy) / out.fy);
+    camera.project(ray)
 }
 
 /// The taps of one plane: `position(u, v)` is the source position (in samples of this plane) of output sample
@@ -541,44 +721,195 @@ mod tests {
         }
     }
 
+    fn opts(projection: Projection, balance: f64) -> Options {
+        Options {
+            projection,
+            output_size: None,
+            balance,
+            interpolation: Interpolation::Bilinear,
+        }
+    }
+
+    /// `cv2.initUndistortRectifyMap` / `cv2.fisheye.initUndistortRectifyMap` (CV_32FC1) for one camera
+    /// (fx 600, fy 590, cx 652.5, cy 351.25) into one pinhole (fx 420, fy 410, cx 640, cy 360), at six output pixels.
     #[test]
-    fn distort_and_undistort_are_inverses() {
-        for model in [Model::Equidistant, Model::PlumbBob] {
-            let c = Intrinsics {
+    fn remap_positions_match_opencv_for_every_model() {
+        type Case = (Model, &'static [f64], [(f64, f64, f64, f64); 6]);
+        let cases: [Case; 3] = [
+            (
+                Model::PlumbBob,
+                &[-0.28, 0.07, 0.0012, -0.0009, -0.008],
+                [
+                    (0.0, 0.0, 131.93, 59.423),
+                    (100.0, 50.0, 160.713, 69.132),
+                    (640.0, 360.0, 652.5, 351.25),
+                    (1000.0, 600.0, 1047.635, 617.754),
+                    (1279.0, 719.0, 1168.568, 646.43),
+                    (320.0, 700.0, 311.457, 716.424),
+                ],
+            ),
+            (
+                Model::RationalPolynomial,
+                &[0.9, -0.3, 0.0011, -0.0007, 0.02, 1.2, -0.1, 0.05],
+                [
+                    (0.0, 0.0, 388.048, 204.151),
+                    (100.0, 50.0, 291.632, 144.553),
+                    (640.0, 360.0, 652.5, 351.25),
+                    (1000.0, 600.0, 1030.22, 605.909),
+                    (1279.0, 719.0, 915.514, 502.829),
+                    (320.0, 700.0, 335.176, 691.126),
+                ],
+            ),
+            (
+                Model::Equidistant,
+                &[0.03, -0.012, 0.004, -0.001],
+                [
+                    (0.0, 0.0, 92.361, 33.866),
+                    (100.0, 50.0, 135.188, 52.102),
+                    (640.0, 360.0, 652.5, 351.25),
+                    (1000.0, 600.0, 1056.965, 622.866),
+                    (1279.0, 719.0, 1212.371, 668.095),
+                    (320.0, 700.0, 303.968, 724.275),
+                ],
+            ),
+        ];
+        let out = Output {
+            projection: Projection::Pinhole,
+            width: 1280,
+            height: 720,
+            fx: 420.0,
+            fy: 410.0,
+            cx: 640.0,
+            cy: 360.0,
+        };
+        for (model, d, points) in cases {
+            let camera = Intrinsics {
+                width: 1280,
+                height: 720,
+                fx: 600.0,
+                fy: 590.0,
+                cx: 652.5,
+                cy: 351.25,
                 model,
-                coefficients: vec![-0.05, 0.01, 0.001, -0.002, 0.0],
-                ..fisheye()
+                coefficients: d.to_vec(),
             };
-            for (x, y) in [(0.1, -0.2), (0.6, 0.3), (-0.9, 0.5)] {
-                let (xd, yd) = c.distort(x, y);
-                let (xu, yu) = c.undistort(xd, yd);
+            for (u, v, x, y) in points {
+                let (gx, gy) = source_position(&camera, &out, u, v).unwrap();
                 assert!(
-                    (xu - x).abs() < 1e-9 && (yu - y).abs() < 1e-9,
-                    "{model:?} {x},{y} -> {xu},{yu}"
+                    (gx - x).abs() < 2e-3 && (gy - y).abs() < 2e-3,
+                    "{model:?} ({u},{v}): {gx},{gy} vs OpenCV {x},{y}"
                 );
             }
         }
     }
 
-    /// The values OpenCV's `cv2.fisheye.estimateNewCameraMatrixForUndistortRectify` gives for the same camera.
+    /// `cv2.fisheye.estimateNewCameraMatrixForUndistortRectify` for fx = fy = 486, k = 0.02, -0.01, 0.003, 0.
     #[test]
     fn new_camera_matches_opencv() {
-        let opts = Options {
-            output_size: None,
-            balance: 0.0,
-            interpolation: Interpolation::Bilinear,
+        let c = Intrinsics {
+            coefficients: vec![0.02, -0.01, 0.003, 0.0],
+            ..fisheye()
         };
-        let k = new_camera(&fisheye(), &opts);
-        assert!((k.fx - 393.679788894805).abs() < 1e-6, "{}", k.fx);
-        assert!((k.cx - 640.0).abs() < 1e-6 && (k.cy - 360.0).abs() < 1e-6);
-        let k = new_camera(
-            &fisheye(),
-            &Options {
-                balance: 1.0,
-                ..opts
-            },
+        for (balance, f) in [(0.0, 398.56284), (0.5, 290.976456), (1.0, 183.390073)] {
+            let k = new_camera(&c, &opts(Projection::Pinhole, balance));
+            assert!(
+                (k.fx - f).abs() < 1e-5 && (k.fy - f).abs() < 1e-5,
+                "balance {balance}: {}",
+                k.fx
+            );
+            assert!((k.cx - 640.0).abs() < 1e-6 && (k.cy - 360.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn unproject_inverts_project_for_every_model() {
+        for (model, d) in [
+            (Model::PlumbBob, vec![-0.2, 0.05, 0.001, -0.002, 0.0]),
+            (
+                Model::RationalPolynomial,
+                vec![0.9, -0.3, 0.0011, -0.0007, 0.02, 1.2, -0.1, 0.05],
+            ),
+            (Model::Equidistant, vec![0.03, -0.012, 0.004, -0.001]),
+        ] {
+            let c = Intrinsics {
+                model,
+                coefficients: d,
+                ..fisheye()
+            };
+            for (u, v) in [(640.0, 360.0), (300.0, 200.0), (1100.0, 600.0)] {
+                let (pu, pv) = c.project(c.unproject(u, v)).unwrap();
+                assert!(
+                    (pu - u).abs() < 1e-6 && (pv - v).abs() < 1e-6,
+                    "{model:?} {u},{v} -> {pu},{pv}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_fisheye_sees_past_ninety_degrees_and_a_pinhole_model_does_not() {
+        let side = [1.0, 0.0, -0.1];
+        assert!(fisheye().project(side).is_some());
+        assert!(Intrinsics {
+            model: Model::PlumbBob,
+            ..fisheye()
+        }
+        .project(side)
+        .is_none());
+    }
+
+    #[test]
+    fn unknown_models_and_too_many_coefficients_are_config_errors() {
+        assert_eq!(
+            "kannala_brandt".parse::<Model>().unwrap(),
+            Model::Equidistant
         );
-        assert!((k.fx - 166.09655666).abs() < 1e-6, "{}", k.fx);
+        assert_eq!("fisheye".parse::<Model>().unwrap(), Model::Equidistant);
+        assert_eq!(
+            "rational_polynomial".parse::<Model>().unwrap(),
+            Model::RationalPolynomial
+        );
+        assert!(
+            format!("{:#}", "double_sphere".parse::<Model>().unwrap_err())
+                .contains("unknown distortion model")
+        );
+        let c = Intrinsics {
+            coefficients: vec![0.0; 5],
+            ..fisheye()
+        };
+        assert!(format!(
+            "{:#}",
+            Deskew::new(c, opts(Projection::Pinhole, 0.0))
+                .err()
+                .unwrap()
+        )
+        .contains("at most 4"));
+        assert!("mercator".parse::<Projection>().is_err());
+    }
+
+    #[test]
+    fn cylindrical_keeps_azimuth_linear_and_fits_the_whole_width() {
+        // a zero-coefficient fisheye's edge midpoints are 640/486 rad (sideways) and 360/486 rad (up) off axis
+        let out = new_camera(&fisheye(), &opts(Projection::Cylindrical, 1.0));
+        // balance 1 keeps the whole field of view: the smaller of the two scales (here the vertical one) wins
+        let vertical = 360.0 / (360.0f64 / 486.0).tan();
+        assert!((out.fx - vertical).abs() < 1e-6, "{}", out.fx);
+        // balance 0 fills the frame: the horizontal extent sets the scale
+        let fill = new_camera(&fisheye(), &opts(Projection::Cylindrical, 0.0));
+        assert!((fill.fx - 486.0).abs() < 1e-6, "{}", fill.fx);
+        // along the center row the source position moves linearly in angle
+        let (x, _) = source_position(&fisheye(), &fill, fill.cx + fill.fx * 0.5, fill.cy).unwrap();
+        assert!((x - (640.0 + 486.0 * 0.5)).abs() < 1e-6, "{x}");
+    }
+
+    #[test]
+    fn equirectangular_maps_angles_linearly_both_ways() {
+        let out = new_camera(&fisheye(), &opts(Projection::Equirectangular, 0.5));
+        let (x, y) = source_position(&fisheye(), &out, out.cx, out.cy + out.fy * 0.3).unwrap();
+        assert!(
+            (x - 640.0).abs() < 1e-6 && (y - (360.0 + 486.0 * 0.3)).abs() < 1e-6,
+            "{x},{y}"
+        );
     }
 
     #[test]
@@ -593,15 +924,7 @@ mod tests {
             model: Model::PlumbBob,
             coefficients: vec![],
         };
-        let mut d = Deskew::new(
-            pinhole,
-            Options {
-                output_size: None,
-                balance: 0.0,
-                interpolation: Interpolation::Bilinear,
-            },
-        )
-        .unwrap();
+        let mut d = Deskew::new(pinhole, opts(Projection::Pinhole, 0.0)).unwrap();
         let (w, h) = (64u32, 48u32);
         d.prepare(w, h, Sampling::Yuv420);
         let (stride, rows) = layout(w, h);
@@ -638,47 +961,16 @@ mod tests {
     }
 
     #[test]
-    fn the_image_center_stays_put_and_corners_pull_inward() {
-        let c = fisheye();
-        let out = new_camera(
-            &c,
-            &Options {
-                output_size: None,
-                balance: 0.0,
-                interpolation: Interpolation::Bilinear,
-            },
-        );
-        let (x, y) = source_position(&c, &out, 640.0, 360.0);
-        assert!((x - 640.0).abs() < 1e-9 && (y - 360.0).abs() < 1e-9);
-        // a fisheye compresses the periphery: an output corner comes from closer to the center
-        let (x, y) = source_position(&c, &out, 0.0, 0.0);
-        assert!(x > 0.0 && y > 0.0, "{x},{y}");
-    }
-
-    #[test]
     fn output_size_scales_the_new_camera() {
         let half = Options {
             output_size: Some((640, 360)),
-            balance: 0.0,
-            interpolation: Interpolation::Nearest,
+            ..opts(Projection::Pinhole, 0.0)
         };
-        let full = Options {
-            output_size: None,
-            ..half
-        };
-        let (a, b) = (new_camera(&fisheye(), &half), new_camera(&fisheye(), &full));
+        let (a, b) = (
+            new_camera(&fisheye(), &half),
+            new_camera(&fisheye(), &opts(Projection::Pinhole, 0.0)),
+        );
         assert!((a.fx * 2.0 - b.fx).abs() < 1e-9 && (a.cx * 2.0 - b.cx).abs() < 1e-9);
         assert_eq!((a.width, a.height), (640, 360));
-    }
-
-    #[test]
-    fn model_and_interpolation_names() {
-        assert_eq!("equidistant".parse::<Model>().unwrap(), Model::Equidistant);
-        assert_eq!("plumb_bob".parse::<Model>().unwrap(), Model::PlumbBob);
-        assert!("kb4".parse::<Model>().is_err());
-        assert_eq!(
-            "bilinear".parse::<Interpolation>().unwrap(),
-            Interpolation::Bilinear
-        );
     }
 }

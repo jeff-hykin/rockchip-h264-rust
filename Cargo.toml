@@ -1,6 +1,6 @@
 [package]
 name = "rockchip-h264"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Pure-Rust MJPEG -> H.264 on the Rockchip RK3588: the hardware JPEG decoder and VEPU580 H.264 encoder driven straight through /dev/mpp_service, no MPP library"
 license = "Apache-2.0"

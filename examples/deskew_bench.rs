@@ -45,6 +45,7 @@ fn main() -> Result<()> {
         .map(|s| s.parse())
         .collect::<Result<_, _>>()?;
     let options = Options {
+        projection: flag("--projection").unwrap_or("pinhole".into()).parse()?,
         output_size: flag("--output-size").map(|s| {
             let (w, h) = s.split_once('x').expect("WxH");
             (w.parse().unwrap(), h.parse().unwrap())

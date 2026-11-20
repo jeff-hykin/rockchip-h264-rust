@@ -30,6 +30,8 @@ struct Args {
     config: Config,
     /// deskew every frame (`--deskew`)
     deskew: Option<DeskewArgs>,
+    /// `pinhole`, `cylindrical` or `equirectangular` (`--deskew-projection`)
+    deskew_projection: String,
 }
 
 fn parse_args() -> Result<Args> {
@@ -44,6 +46,7 @@ fn parse_args() -> Result<Args> {
         stats_every: 5.0,
         config: Config::default(),
         deskew: None,
+        deskew_projection: "pinhole".into(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -60,6 +63,7 @@ fn parse_args() -> Result<Args> {
             "--fps" => a.config.fps = value()?.parse()?,
             "--bitrate" => a.config.bitrate_bps = value()?.parse()?,
             "--gop" => a.config.gop = value()?.parse()?,
+            "--deskew-projection" => a.deskew_projection = value()?,
             // e.g. --deskew equidistant:486:0,0,0,0:0.0:1280x720:bilinear (focal at the --width given)
             "--deskew" => {
                 let v = value()?;
@@ -164,6 +168,7 @@ fn run_stream(
             coefficients: coefficients.clone(),
         };
         let options = rockchip_h264::deskew::Options {
+            projection: args.deskew_projection.parse()?,
             output_size: *output_size,
             balance: *balance,
             interpolation: interpolation.parse()?,

@@ -25,6 +25,8 @@ the M20 cameras' MJPEG sizes (1920x1080, 1280x960, 1280x720, 1024x768, 848x480, 
 with `tools/mppshim.c` (`tools/captures/`, `tools/vepu580_fixtures.py`). One field follows the vendor build rather
 than current MPP: `src_range` (0, where current MPP writes 1).
 
+`Transcoder::set_deskew` undistorts each frame before encoding (plumb_bob, rational_polynomial or equidistant lens; pinhole, cylindrical or equirectangular output; nearest or bilinear); `deskew_gpu` is an OpenCL (Mali) version of the same remap, verified against the CPU path but not usable on the M20's AOS board (its Mali firmware fails to load and its `libmali` is older than the kernel driver).
+
 ## Tracks
 
 The register programming and ioctl ABI follow these files:
