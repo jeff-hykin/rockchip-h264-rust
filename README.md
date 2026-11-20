@@ -11,6 +11,8 @@ t.transcode(&jpeg_bytes, &mut access_unit)?; // Annex-B, SPS/PPS before each IDR
 
 `rockchip_h264::v4l2::Capture` reads MJPEG off a UVC camera; `examples/mjpeg2h264.rs` is a test harness. Needs root.
 
+`nix build` (crate2nix) builds the library and the harness, and `nix flake check` runs the tests; for the board, `cargo zigbuild --release --target aarch64-unknown-linux-gnu.2.31`.
+
 `Transcoder::new` refuses to run on anything but a tested platform (kernel release, `mpp_service` driver version,
 SoC, command support, hardware ids), naming what differs. Tested: Deep Robotics M20 AOS board, RK3588, Rockchip BSP
 kernel 5.10.198.
