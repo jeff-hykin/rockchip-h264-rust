@@ -1,0 +1,14 @@
+[package]
+name = "rockchip-h264"
+version = "0.1.0"
+edition = "2021"
+description = "Pure-Rust MJPEG -> H.264 on the Rockchip RK3588: the hardware JPEG decoder and VEPU580 H.264 encoder driven straight through /dev/mpp_service, no MPP library"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+libc = "0.2"
+anyhow = "1"
+
+[profile.release]
+debug = 1
