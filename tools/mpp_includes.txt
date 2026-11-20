@@ -1,0 +1,13 @@
+-I$MPP/mpp/hal/rkenc/h264e
+-I$MPP/mpp/hal/rkenc/common
+-I$MPP/mpp/hal/inc
+-I$MPP/mpp/hal/common
+-I$MPP/osal/inc
+-I$MPP/inc
+-I$MPP/mpp/inc
+-I$MPP/mpp/base/inc
+-I$MPP/kmpp/inc
+-I$MPP/mpp/common
+-I$MPP/utils
+-I$MPP/mpp/codec/inc
+-I$MPP/kmpp/base/inc

@@ -80,14 +80,49 @@ pub const LOG2_MAX_POC_LSB_MINUS4: u32 = 12;
 pub const CHROMA_QP_INDEX_OFFSET: i32 = -6;
 pub const PIC_INIT_QP: u32 = 26;
 
-/// High profile, level 4.0, one reference frame, CABAC, 8x8 transform, VUI with timing (as MPP writes it).
+/// `level_infos` (h264e_sps.c): (level_idc, the frame size in macroblocks MPP compares against)
+const LEVEL_MAX_MBS: [(u32, u32); 20] = [
+    (10, 1485),
+    (9, 1485),
+    (11, 3000),
+    (12, 6000),
+    (13, 11880),
+    (20, 11880),
+    (21, 19800),
+    (22, 20250),
+    (30, 40500),
+    (31, 108000),
+    (32, 216000),
+    (40, 245760),
+    (41, 245760),
+    (42, 522240),
+    (50, 589824),
+    (51, 983040),
+    (52, 2073600),
+    (60, 4177920),
+    (61, 8355840),
+    (62, 16711680),
+];
+/// MPP's default level (`h264->level` = 4.0)
+const DEFAULT_LEVEL: u32 = 40;
+
+/// The level MPP's `h264e_sps_update` picks: the default, raised if the frame is larger than its table entry allows.
+pub fn level_idc(width: u32, height: u32) -> u32 {
+    let mbs = width.next_multiple_of(16) * height.next_multiple_of(16) / 256;
+    match LEVEL_MAX_MBS.iter().find(|(_, max)| *max >= mbs) {
+        Some(&(level, _)) if level > DEFAULT_LEVEL && level != 9 => level,
+        _ => DEFAULT_LEVEL,
+    }
+}
+
+/// High profile, level from [`level_idc`], one reference frame, CABAC, 8x8 transform, VUI with timing (as MPP writes it).
 pub fn sps(p: StreamParams) -> Vec<u8> {
     let mbs_w = p.width.div_ceil(16);
     let mbs_h = p.height.div_ceil(16);
     let mut b = Bits::default();
     b.put(8, 100); // profile_idc: High
     b.put(8, 0x10); // constraint_set3_flag (as MPP sets it)
-    b.put(8, 40); // level_idc
+    b.put(8, level_idc(p.width, p.height));
     b.ue(0); // seq_parameter_set_id
     b.ue(1); // chroma_format_idc: 4:2:0
     b.ue(0); // bit_depth_luma_minus8
@@ -190,6 +225,65 @@ mod tests {
             hex("0000000167641028ac1b1aa05005ba10000003001000000303c8f08846a0")
         );
         assert_eq!(pps(), hex("0000000168ee31b21b"));
+    }
+
+    /// The vendor stream's SPS at every MJPEG size the M20's cameras offer (cropping where the height isn't 16-aligned).
+    #[test]
+    fn sps_matches_the_vendor_at_every_camera_size() {
+        let vendor = [
+            (
+                1920,
+                1080,
+                "0000000167641028ac1b1aa0780227e584000003000400000300f23c2211a8",
+            ),
+            (
+                640,
+                480,
+                "0000000167641028ac1b1aa0a03da10000030001000003003c8f08846a",
+            ),
+            (
+                1280,
+                960,
+                "0000000167641028ac1b1aa050079a10000003001000000303c8f08846a0",
+            ),
+            (
+                1024,
+                768,
+                "0000000167641028ac1b1aa040061a10000003001000000303c8f08846a0",
+            ),
+            (
+                848,
+                480,
+                "0000000167641028ac1b1aa0d43da10000030001000003003c8f08846a",
+            ),
+            (
+                800,
+                600,
+                "0000000167641028ac1b1aa0c8137e5840000003004000000f23c2211a80",
+            ),
+            (
+                640,
+                360,
+                "0000000167641028ac1b1aa0a02ff9610000030001000003003c8f08846a",
+            ),
+        ];
+        for (width, height, want) in vendor {
+            assert_eq!(
+                sps(StreamParams {
+                    width,
+                    height,
+                    fps: 30
+                }),
+                hex(want),
+                "{width}x{height}"
+            );
+        }
+    }
+
+    #[test]
+    fn levels_follow_the_mpp_table() {
+        assert_eq!(level_idc(1920, 1080), 40);
+        assert_eq!(level_idc(4096, 4096), 40);
     }
 
     #[test]

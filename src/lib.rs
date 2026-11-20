@@ -21,14 +21,19 @@ pub mod rc;
 pub mod service;
 pub mod v4l2;
 pub mod vepu580;
-pub mod vepu580_template;
+#[cfg(test)]
+mod vepu580_fixtures;
+pub mod vepu580_regs;
+pub mod vepu580_setup;
+pub mod vepu580_tables;
 pub mod vepu580_tune;
 
 use anyhow::Result;
 
 pub use vepu580::Frame;
 
-/// The stream to produce: what `mpph264enc rc-mode=cbr bps=... gop=...` was told.
+/// The stream to produce: what `mpph264enc rc-mode=cbr bps=... gop=...` was told. `width` and `height` are what
+/// the stream is expected to be; each JPEG's own size is what gets encoded (see [`Transcoder::transcode`]).
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     pub width: u32,
@@ -49,45 +54,58 @@ impl Default for Config {
             fps: 30,
             bitrate_bps: 4_000_000,
             gop: 30,
-            max_jpeg_bytes: 2 << 20,
+            max_jpeg_bytes: 4 << 20,
         }
     }
 }
 
 /// One MJPEG -> H.264 stream: a JPEG decoder session, an encoder session and the frame buffer between them.
 pub struct Transcoder {
+    config: Config,
+    heap: dma::Heap,
     decoder: jpegd::JpegDecoder,
-    encoder: vepu580::H264Encoder,
-    frame: dma::DmaBuf,
+    /// the encoder and the decoder's output buffer, both sized for the current frame size (None between sizes)
+    sized: Option<(vepu580::H264Encoder, dma::DmaBuf)>,
+    size: (u32, u32),
+    resizes: u32,
     platform: &'static platform::Tested,
 }
 
 impl Transcoder {
-    /// Checks the platform (refusing an untested one), then opens both hardware sessions and allocates every buffer.
+    /// Checks the platform (refusing an untested one) and the configured size, then opens both hardware sessions and
+    /// allocates every buffer.
     pub fn new(config: Config) -> Result<Self> {
         let (_, tested) = platform::probe_and_check()?;
         let heap = dma::Heap::open()?;
+        let sized = Self::sized(&heap, &config, config.width, config.height)?;
         Ok(Self {
-            decoder: jpegd::JpegDecoder::new(
-                &heap,
-                config.width,
-                config.height,
-                config.max_jpeg_bytes,
-            )?,
-            encoder: vepu580::H264Encoder::new(
-                &heap,
-                vepu580::EncoderConfig {
-                    width: config.width,
-                    height: config.height,
-                    fps: config.fps,
-                    bitrate_bps: config.bitrate_bps,
-                    gop: config.gop,
-                },
-            )?,
-            // semi-planar YUV, room for 4:2:2
-            frame: heap.alloc((config.width * config.height.next_multiple_of(16) * 2) as usize)?,
+            config,
+            decoder: jpegd::JpegDecoder::new(&heap, config.max_jpeg_bytes)?,
+            heap,
+            sized: Some(sized),
+            size: (config.width, config.height),
+            resizes: 0,
             platform: tested,
         })
+    }
+
+    fn sized(
+        heap: &dma::Heap,
+        config: &Config,
+        width: u32,
+        height: u32,
+    ) -> Result<(vepu580::H264Encoder, dma::DmaBuf)> {
+        let encoder = vepu580::H264Encoder::new(
+            heap,
+            vepu580::EncoderConfig {
+                width,
+                height,
+                fps: config.fps,
+                bitrate_bps: config.bitrate_bps,
+                gop: config.gop,
+            },
+        )?;
+        Ok((encoder, heap.alloc(jpegd::output_size(width, height))?))
     }
 
     /// Which tested platform this is.
@@ -95,15 +113,48 @@ impl Transcoder {
         self.platform
     }
 
-    /// Decodes one JPEG and encodes it as one Annex-B access unit into `out` (replacing its contents). A JPEG that
-    /// fails to decode is an error and leaves the stream intact; an encoder failure makes the next frame an IDR.
+    /// The size being encoded now.
+    pub fn size(&self) -> (u32, u32) {
+        self.size
+    }
+
+    /// How many times the stream changed size.
+    pub fn resizes(&self) -> u32 {
+        self.resizes
+    }
+
+    /// Decodes one JPEG and encodes it as one Annex-B access unit into `out` (replacing its contents).
+    ///
+    /// The size encoded is the JPEG's own (its SOF header), not the configured one: if it changes, the encoder and
+    /// its buffers are rebuilt for the new size (the old ones released first) and the stream restarts with new
+    /// parameter sets and an IDR. A JPEG that fails to parse or decode is an error and leaves the stream intact; an
+    /// encoder failure makes the next frame an IDR.
     pub fn transcode(&mut self, jpeg: &[u8], out: &mut Vec<u8>) -> Result<Frame> {
-        let sampling = self.decoder.decode(jpeg, &self.frame)?;
-        self.encoder.encode(&self.frame, sampling, out)
+        let header = jpeg::parse(&jpeg[..jpeg::trimmed_len(jpeg)])?;
+        if (header.width, header.height) != self.size || self.sized.is_none() {
+            vepu580::check_size(header.width, header.height)?;
+            // release the old size's session and buffers before taking the new ones
+            self.sized = None;
+            self.sized = Some(Self::sized(
+                &self.heap,
+                &self.config,
+                header.width,
+                header.height,
+            )?);
+            if (header.width, header.height) != self.size {
+                self.resizes += 1;
+            }
+            self.size = (header.width, header.height);
+        }
+        let (encoder, frame) = self.sized.as_mut().expect("set above");
+        let sampling = self.decoder.decode(jpeg, &header, frame)?;
+        encoder.encode(frame, sampling, out)
     }
 
     /// Makes the next frame an IDR.
     pub fn force_idr(&mut self) {
-        self.encoder.force_idr();
+        if let Some((encoder, _)) = self.sized.as_mut() {
+            encoder.force_idr();
+        }
     }
 }

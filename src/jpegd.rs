@@ -1,11 +1,11 @@
 //! The RK3588 hardware JPEG decoder (RKJPEGD, MPP's "jpegd_rkv"): one 42-register task per frame, the Huffman and
 //! quantization tables in a small dmabuf, output YUV semi-planar (NV12 for 4:2:0, NV16 for 4:2:2) with the luma plane
-//! `width * height` bytes and the chroma plane right after it.
+//! its 16-aligned stride times 16-aligned rows, and the chroma plane right after it.
 //!
 //! Mirrors MPP `mpp/hal/vpu/jpegd/hal_jpegd_rkv.c`, `hal_jpegd_vpu7xx_com.c`, `hal_jpegd_rkv_reg.h` and the kernel's
 //! `mpp_jpgdec.c` (registers 9..=13 hold dmabuf fds the kernel translates).
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 
 use crate::dma::{DmaBuf, Heap};
 use crate::jpeg::{self, Header, Huffman, Sampling};
@@ -38,8 +38,6 @@ pub struct JpegDecoder {
     session: Session,
     tables: DmaBuf,
     stream: DmaBuf,
-    width: u32,
-    height: u32,
 }
 
 /// The decoder's register words for one frame; `table_fd`/`stream_fd`/`out_fd` go in the address registers.
@@ -181,39 +179,39 @@ fn min_codes(table: &Huffman) -> ([u16; 16], [u16; 16]) {
     (min_code, acc_addr)
 }
 
+/// Bytes the decoder writes for a `width`x`height` frame: a 16-aligned luma stride, rows padded to 16, and a
+/// semi-planar chroma plane of up to the same size (4:2:2).
+pub fn output_size(width: u32, height: u32) -> usize {
+    (width.next_multiple_of(16) * height.next_multiple_of(16) * 2) as usize
+}
+
 impl JpegDecoder {
-    /// A decoder session for `width`x`height` JPEGs of up to `max_jpeg` bytes.
-    pub fn new(heap: &Heap, width: u32, height: u32, max_jpeg: usize) -> Result<Self> {
+    /// A decoder session for JPEGs of up to `max_jpeg` bytes, any size.
+    pub fn new(heap: &Heap, max_jpeg: usize) -> Result<Self> {
         Ok(Self {
             session: Session::new(client::RKJPEGD).context("opening the JPEG decoder")?,
             tables: heap.alloc(TABLE_SIZE)?,
             stream: heap.alloc(max_jpeg.next_multiple_of(4096) + 4096)?,
-            width,
-            height,
         })
     }
 
-    /// Decodes `jpeg` into `out` (at least `width * height * 2` bytes); returns its sampling.
-    pub fn decode(&mut self, jpeg: &[u8], out: &DmaBuf) -> Result<Sampling> {
+    /// Decodes `jpeg` (already parsed into `header`) into `out`, at least [`output_size`] bytes.
+    pub fn decode(&mut self, jpeg: &[u8], header: &Header, out: &DmaBuf) -> Result<Sampling> {
         let len = jpeg::trimmed_len(jpeg);
         let jpeg = &jpeg[..len];
-        let header = jpeg::parse(jpeg)?;
-        if (header.width, header.height) != (self.width, self.height) {
-            bail!(
-                "JPEG is {}x{}, decoder set up for {}x{}",
-                header.width,
-                header.height,
-                self.width,
-                self.height
-            );
-        }
         ensure!(
             len + 64 <= self.stream.len(),
             "{len}-byte JPEG is larger than the {}-byte input buffer",
             self.stream.len()
         );
         ensure!(
-            out.len() >= (self.width * self.height * 2) as usize,
+            header.width <= 0xffff && header.height <= 0xffff,
+            "JPEG {}x{} is too large",
+            header.width,
+            header.height
+        );
+        ensure!(
+            out.len() >= output_size(header.width, header.height),
             "output buffer too small"
         );
         let sampling = header.sampling()?;
@@ -222,9 +220,8 @@ impl JpegDecoder {
             // the hardware reads whole 16-byte words past the end of the stream
             b[len..len + 64].fill(0);
         })?;
-        self.tables.write(|t| write_tables(&header, t))??;
-        let (regs, offsets) =
-            registers(&header, len, self.tables.fd(), self.stream.fd(), out.fd())?;
+        self.tables.write(|t| write_tables(header, t))??;
+        let (regs, offsets) = registers(header, len, self.tables.fd(), self.stream.fd(), out.fd())?;
         let mut status = [0u32; REG_COUNT];
         self.session.run(
             &[Write {
