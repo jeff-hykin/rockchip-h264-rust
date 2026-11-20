@@ -12,6 +12,7 @@
 //! t.transcode(&jpeg, &mut access_unit).unwrap();
 //! ```
 
+pub mod deskew;
 pub mod dma;
 pub mod h264;
 pub mod jpeg;
@@ -59,13 +60,22 @@ impl Default for Config {
     }
 }
 
+/// What one input size needs: the encoder (sized to the output), the decoded frame, the deskewed frame.
+struct Sized {
+    encoder: vepu580::H264Encoder,
+    decoded: dma::DmaBuf,
+    deskewed: Option<dma::DmaBuf>,
+}
+
 /// One MJPEG -> H.264 stream: a JPEG decoder session, an encoder session and the frame buffer between them.
 pub struct Transcoder {
     config: Config,
     heap: dma::Heap,
     decoder: jpegd::JpegDecoder,
-    /// the encoder and the decoder's output buffer, both sized for the current frame size (None between sizes)
-    sized: Option<(vepu580::H264Encoder, dma::DmaBuf)>,
+    /// the encoder, the decoder's output buffer and (when deskewing) the deskewed frame's buffer, sized for the
+    /// current input size (None between sizes)
+    sized: Option<Sized>,
+    deskew: Option<deskew::Deskew>,
     size: (u32, u32),
     resizes: u32,
     platform: &'static platform::Tested,
@@ -77,12 +87,13 @@ impl Transcoder {
     pub fn new(config: Config) -> Result<Self> {
         let (_, tested) = platform::probe_and_check()?;
         let heap = dma::Heap::open()?;
-        let sized = Self::sized(&heap, &config, config.width, config.height)?;
+        let sized = Self::sized(&heap, &config, (config.width, config.height), None)?;
         Ok(Self {
             config,
             decoder: jpegd::JpegDecoder::new(&heap, config.max_jpeg_bytes)?,
             heap,
             sized: Some(sized),
+            deskew: None,
             size: (config.width, config.height),
             resizes: 0,
             platform: tested,
@@ -92,9 +103,11 @@ impl Transcoder {
     fn sized(
         heap: &dma::Heap,
         config: &Config,
-        width: u32,
-        height: u32,
-    ) -> Result<(vepu580::H264Encoder, dma::DmaBuf)> {
+        input: (u32, u32),
+        output: Option<(u32, u32)>,
+    ) -> Result<Sized> {
+        let (width, height) = output.unwrap_or(input);
+        vepu580::check_size(width, height)?;
         let encoder = vepu580::H264Encoder::new(
             heap,
             vepu580::EncoderConfig {
@@ -105,7 +118,26 @@ impl Transcoder {
                 gop: config.gop,
             },
         )?;
-        Ok((encoder, heap.alloc(jpegd::output_size(width, height))?))
+        Ok(Sized {
+            encoder,
+            decoded: heap.alloc(jpegd::output_size(input.0, input.1))?,
+            deskewed: match output {
+                Some((w, h)) => Some(heap.alloc(jpegd::output_size(w, h))?),
+                None => None,
+            },
+        })
+    }
+
+    /// Deskews every frame from now on (`None`: stop). The tables are built on the next frame, once per input size,
+    /// and the encoder restarts (new parameter sets, an IDR) at the deskewed size.
+    pub fn set_deskew(&mut self, deskew: Option<deskew::Deskew>) {
+        self.deskew = deskew;
+        self.sized = None;
+    }
+
+    /// The deskew in use, if any.
+    pub fn deskew(&self) -> Option<&deskew::Deskew> {
+        self.deskew.as_ref()
     }
 
     /// Which tested platform this is.
@@ -131,30 +163,64 @@ impl Transcoder {
     /// encoder failure makes the next frame an IDR.
     pub fn transcode(&mut self, jpeg: &[u8], out: &mut Vec<u8>) -> Result<Frame> {
         let header = jpeg::parse(&jpeg[..jpeg::trimmed_len(jpeg)])?;
-        if (header.width, header.height) != self.size || self.sized.is_none() {
-            vepu580::check_size(header.width, header.height)?;
+        let input = (header.width, header.height);
+        let sampling = header.sampling()?;
+        if input != self.size || self.sized.is_none() {
+            vepu580::check_size(input.0, input.1)?;
             // release the old size's session and buffers before taking the new ones
             self.sized = None;
-            self.sized = Some(Self::sized(
-                &self.heap,
-                &self.config,
-                header.width,
-                header.height,
-            )?);
-            if (header.width, header.height) != self.size {
+            let output = self
+                .deskew
+                .as_ref()
+                .map(|d| d.output_size(input.0, input.1));
+            self.sized = Some(Self::sized(&self.heap, &self.config, input, output)?);
+            if input != self.size {
                 self.resizes += 1;
             }
-            self.size = (header.width, header.height);
+            self.size = input;
         }
-        let (encoder, frame) = self.sized.as_mut().expect("set above");
-        let sampling = self.decoder.decode(jpeg, &header, frame)?;
-        encoder.encode(frame, sampling, out)
+        let sized = self.sized.as_mut().expect("set above");
+        self.decoder.decode(jpeg, &header, &sized.decoded)?;
+        match (self.deskew.as_mut(), sized.deskewed.as_mut()) {
+            (Some(deskew), Some(deskewed)) => {
+                deskew.prepare(input.0, input.1, sampling);
+                let (sw, sh) = input;
+                let (dw, dh) = deskew.output_size(sw, sh);
+                let ((s_stride, s_rows), (d_stride, d_rows)) =
+                    (deskew::layout(sw, sh), deskew::layout(dw, dh));
+                let decoded = &sized.decoded;
+                decoded.read(decoded.len(), |src| {
+                    deskewed.write(|dst| {
+                        deskew.apply(
+                            &deskew::Planes {
+                                width: sw,
+                                height: sh,
+                                stride: s_stride,
+                                rows: s_rows,
+                                sampling,
+                                bytes: src,
+                            },
+                            &mut deskew::PlanesMut {
+                                width: dw,
+                                height: dh,
+                                stride: d_stride,
+                                rows: d_rows,
+                                sampling,
+                                bytes: dst,
+                            },
+                        )
+                    })
+                })???;
+                sized.encoder.encode(deskewed, sampling, out)
+            }
+            _ => sized.encoder.encode(&sized.decoded, sampling, out),
+        }
     }
 
     /// Makes the next frame an IDR.
     pub fn force_idr(&mut self) {
-        if let Some((encoder, _)) = self.sized.as_mut() {
-            encoder.force_idr();
+        if let Some(sized) = self.sized.as_mut() {
+            sized.encoder.force_idr();
         }
     }
 }

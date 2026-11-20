@@ -15,6 +15,9 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use rockchip_h264::{platform, v4l2, Config, Transcoder};
 
+/// model, focal px at --width, coefficients, balance, output size, interpolation
+type DeskewArgs = (String, f64, Vec<f64>, f64, Option<(u32, u32)>, String);
+
 struct Args {
     check: bool,
     jpeg_dir: Option<String>,
@@ -25,6 +28,8 @@ struct Args {
     pace: bool,
     stats_every: f64,
     config: Config,
+    /// deskew every frame (`--deskew`)
+    deskew: Option<DeskewArgs>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -38,6 +43,7 @@ fn parse_args() -> Result<Args> {
         pace: true,
         stats_every: 5.0,
         config: Config::default(),
+        deskew: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -54,6 +60,32 @@ fn parse_args() -> Result<Args> {
             "--fps" => a.config.fps = value()?.parse()?,
             "--bitrate" => a.config.bitrate_bps = value()?.parse()?,
             "--gop" => a.config.gop = value()?.parse()?,
+            // e.g. --deskew equidistant:486:0,0,0,0:0.0:1280x720:bilinear (focal at the --width given)
+            "--deskew" => {
+                let v = value()?;
+                let p: Vec<&str> = v.split(':').collect();
+                anyhow::ensure!(
+                    p.len() == 6,
+                    "--deskew model:focal:k1,k2,...:balance:WxH|same:nearest|bilinear"
+                );
+                let size = (p[4] != "same").then(|| {
+                    let (w, h) = p[4].split_once('x').expect("WxH");
+                    (w.parse().unwrap(), h.parse().unwrap())
+                });
+                let coefficients = p[2]
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.parse())
+                    .collect::<Result<_, _>>()?;
+                a.deskew = Some((
+                    p[0].into(),
+                    p[1].parse()?,
+                    coefficients,
+                    p[3].parse()?,
+                    size,
+                    p[5].into(),
+                ));
+            }
             "--width" => a.config.width = value()?.parse()?,
             "--height" => a.config.height = value()?.parse()?,
             other => bail!("unknown argument {other}"),
@@ -119,6 +151,25 @@ fn run_stream(
     stop: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut transcoder = Transcoder::new(args.config)?;
+    if let Some((model, focal, coefficients, balance, output_size, interpolation)) = &args.deskew {
+        let (w, h) = (args.config.width, args.config.height);
+        let camera = rockchip_h264::deskew::Intrinsics {
+            width: w,
+            height: h,
+            fx: *focal,
+            fy: *focal,
+            cx: w as f64 / 2.0,
+            cy: h as f64 / 2.0,
+            model: model.parse()?,
+            coefficients: coefficients.clone(),
+        };
+        let options = rockchip_h264::deskew::Options {
+            output_size: *output_size,
+            balance: *balance,
+            interpolation: interpolation.parse()?,
+        };
+        transcoder.set_deskew(Some(rockchip_h264::deskew::Deskew::new(camera, options)?));
+    }
     let mut sink: Box<dyn std::io::Write> = match args.out.as_deref() {
         None => Box::new(std::io::sink()),
         Some("-") => Box::new(std::io::stdout().lock()),
